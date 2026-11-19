@@ -11,6 +11,7 @@ export const Config = z.object({
   failed: z.boolean().default(true).volatile(),
   approval: z.boolean().default(true).volatile(),
   question: z.boolean().default(true).volatile(),
+  background: z.boolean().default(false).volatile(),
 });
 
 const API = "/api/local-task-notifications";
@@ -29,24 +30,128 @@ export function apply(ctx, config) {
   const pending = new Map();
   const clients = new Map();
   const outcomes = new WeakMap();
+  const goalChanges = new WeakMap();
+  const reportedGoals = new WeakMap();
+  const settledGoalTurns = new WeakSet();
+  const goalTurns = new WeakSet();
+  const settling = new WeakSet();
+  const continuedQuestions = new Map();
+  const activeRequests = new Set();
+  const jobBatches = new Map();
   const instance = randomUUID();
   let sequence = 0;
   let activationInFlight;
 
-  function publish(kind, session, detail = "") {
-    if (!config[kind].get() || lifetime.signal.aborted) return;
-    const event = {
-      id: `${instance}:${++sequence}`,
-      kind,
-      sessionId: session?.id,
-      title: compact(session && ctx.sessionTitle.get(session)?.title, 100),
-      detail: compact(detail, 160),
-    };
+  function enabled(kind) {
+    const preference =
+      {
+        goalCompleted: "completed",
+        goalBlocked: "failed",
+        jobCompleted: "background",
+        jobFailed: "background",
+      }[kind] ?? kind;
+    return config[preference]?.get() === true;
+  }
+
+  function record(event) {
+    event.id = `${instance}:${++sequence}`;
     pending.set(event.id, { event, sequence, claimedBy: null });
     // Only a short-lived delivery ledger, never a copy of chat history.
     if (pending.size > 256) pending.delete(pending.keys().next().value);
     for (const finish of [...waiters]) finish();
     return event.id;
+  }
+
+  function publish(kind, session, detail = "", count) {
+    if (!enabled(kind) || lifetime.signal.aborted) return;
+    const event = {
+      kind,
+      sessionId: session?.id,
+      title: compact(session && ctx.sessionTitle.get(session)?.title, 100),
+      detail: compact(detail, 160),
+      ...(count === undefined ? {} : { count }),
+    };
+    return record(event);
+  }
+
+  function withdraw(id) {
+    if (!id || !activeRequests.delete(id)) return;
+    pending.delete(id);
+    continuedQuestions.delete(id);
+    if (!lifetime.signal.aborted) record({ action: "dismiss", targetId: id });
+  }
+
+  function pruneQuestions() {
+    for (const [id, active] of continuedQuestions) {
+      if (!active()) withdraw(id);
+    }
+  }
+
+  function clearJobs(sessionId) {
+    const batch = jobBatches.get(sessionId);
+    if (batch) clearTimeout(batch.timer);
+    jobBatches.delete(sessionId);
+  }
+
+  function flushJobs(sessionId) {
+    const batch = jobBatches.get(sessionId);
+    if (!batch) return;
+    const agent = ctx.agents.get(sessionId);
+    if (!agent || rootAgent(agent.session) !== agent || !enabled("jobCompleted")) {
+      clearJobs(sessionId);
+      return;
+    }
+    if (agent.status !== "idle") return;
+    clearJobs(sessionId);
+    const jobs = [...batch.jobs.values()];
+    publish(
+      jobs.some((job) => job.status === "failed") ? "jobFailed" : "jobCompleted",
+      agent.session,
+      jobs.map((job) => job.label || job.id).join(" · "),
+      jobs.length,
+    );
+  }
+
+  function settle(agent) {
+    if (settling.has(agent)) return;
+    settling.add(agent);
+    queueMicrotask(() => {
+      settling.delete(agent);
+      if (lifetime.signal.aborted || agent.status !== "idle" || rootAgent(agent.session) !== agent)
+        return;
+      const reason = outcomes.get(agent);
+      outcomes.delete(agent);
+      const terminal = goalChanges.get(agent);
+      goalChanges.delete(agent);
+      const goal = ctx.get("goals")?.get(agent);
+      let published;
+      if (terminal && (!goal || (goal.id === terminal.id && goal.revision === terminal.revision))) {
+        reportedGoals.set(agent, `${terminal.id}:${terminal.revision}`);
+        settledGoalTurns.add(agent);
+        published = publish(
+          terminal.phase === "complete" ? "goalCompleted" : "goalBlocked",
+          agent.session,
+          terminal.blockedReason?.message || terminal.objective,
+        );
+      } else if (reason?.kind === "error") {
+        published = publish("failed", agent.session, reason.error?.message);
+      } else if (
+        reason?.kind === "completed" &&
+        !settledGoalTurns.has(agent) &&
+        goal?.phase !== "active" &&
+        !(goal?.phase === "paused" && goalTurns.has(agent))
+      ) {
+        published = publish("completed", agent.session);
+      }
+      if (published) clearJobs(agent.session.id);
+      else {
+        const batch = jobBatches.get(agent.session.id);
+        if (batch) {
+          clearTimeout(batch.timer);
+          batch.timer = setTimeout(() => flushJobs(agent.session.id), 1000);
+        }
+      }
+    });
   }
 
   function rootAgent(session) {
@@ -70,9 +175,14 @@ export function apply(ctx, config) {
   ctx.on(
     "session/event",
     (session, event) => {
-      if (event.type !== "turn/end") return;
       const agent = rootAgent(session);
-      if (agent) outcomes.set(agent, event.data.reason);
+      if (!agent) return;
+      if (event.type === "user/message") {
+        settledGoalTurns.delete(agent);
+        if (event.data.source?.kind === "goal") goalTurns.add(agent);
+        else goalTurns.delete(agent);
+      }
+      if (event.type === "turn/end") outcomes.set(agent, event.data.reason);
     },
     { global: true },
   );
@@ -81,24 +191,58 @@ export function apply(ctx, config) {
     "agent/status",
     ({ agent, status }) => {
       if (status !== "idle") return;
-      const reason = outcomes.get(agent);
-      outcomes.delete(agent);
-      if (!reason || rootAgent(agent.session) !== agent) return;
-      // The driver drains all queued turns before becoming idle. A synchronous
-      // restart after this edge is still part of the same ongoing activity.
-      queueMicrotask(() => {
-        if (
-          lifetime.signal.aborted ||
-          agent.status !== "idle" ||
-          rootAgent(agent.session) !== agent
-        )
-          return;
-        if (reason.kind === "completed") publish("completed", agent.session);
-        else if (reason.kind === "error") publish("failed", agent.session, reason.error?.message);
-      });
+      settle(agent);
     },
     { global: true },
   );
+
+  ctx.on(
+    "goal/changed",
+    ({ agent, change }) => {
+      if (rootAgent(agent.session) !== agent) return;
+      const goal = change.goal;
+      if (goal?.phase === "complete" || goal?.phase === "blocked") {
+        if (!["complete", "block"].includes(change.operation)) {
+          const terminal = goalChanges.get(agent);
+          if (terminal?.id === goal.id && terminal.phase === goal.phase)
+            goalChanges.set(agent, goal);
+          return;
+        }
+        if (reportedGoals.get(agent) === `${goal.id}:${goal.revision}`) return;
+        goalChanges.set(agent, goal);
+        if (agent.status === "idle") settle(agent);
+      } else {
+        goalChanges.delete(agent);
+        if (change.operation === "pause") goalTurns.add(agent);
+      }
+    },
+    { global: true },
+  );
+
+  ctx.on("agent/disposed", ({ agent }) => clearJobs(agent.session.id), { global: true });
+
+  ctx.inject(["jobs"], (child) => {
+    child.jobs.events.subscribe({ owners: "scope" }, (event) => {
+      if (
+        event.type !== "settled" ||
+        event.awaited ||
+        event.cause === "teardown" ||
+        !["completed", "failed"].includes(event.job.status) ||
+        !enabled("jobCompleted")
+      )
+        return;
+      const agent = ctx.agents.get(event.job.owner);
+      if (!agent || rootAgent(agent.session) !== agent) return;
+      let batch = jobBatches.get(agent.session.id);
+      if (!batch) {
+        batch = { jobs: new Map(), timer: undefined };
+        jobBatches.set(agent.session.id, batch);
+      }
+      batch.jobs.set(event.job.id, event.job);
+      clearTimeout(batch.timer);
+      batch.timer = setTimeout(() => flushJobs(agent.session.id), 1000);
+    });
+  });
 
   async function observeRequest(kind, request, next) {
     if (request.signal?.aborted) return next();
@@ -106,27 +250,44 @@ export function apply(ctx, config) {
     let id;
     try {
       id = publish(kind, session);
+      if (id) activeRequests.add(id);
     } catch (error) {
       console.warn("[task-notifications] Could not publish reminder:", error.message);
     }
     // This observer never answers or delays the human-interaction waterfall.
     // An answered/cancelled request cannot be claimed later by a slow client.
     let continued = false;
+    const timedOut = () =>
+      kind === "question" &&
+      request.wait?.timed &&
+      request.signal?.reason?.code === "ASK_TIMED_OUT";
+    const onAbort = () => {
+      // A timed wait aborts its signal to release the model, but the question
+      // remains answerable. Only its projection tells us when it is settled.
+      if (!timedOut()) withdraw(id);
+    };
+    request.signal?.addEventListener("abort", onAbort, { once: true });
+    if (request.signal?.aborted) onAbort();
     try {
       return await next();
     } catch (error) {
-      continued = kind === "question" && request.wait?.timed && error?.code === "ASK_TIMED_OUT";
-      const entry = pending.get(id);
-      if (continued && entry) {
-        entry.stillPending = () =>
+      continued =
+        timedOut() ||
+        (kind === "question" && request.wait?.timed && error?.code === "ASK_TIMED_OUT");
+      if (continued && id && (!request.signal?.aborted || timedOut())) {
+        const active = () =>
           ctx
             .get("sessionProjections")
             ?.stateOf(session, "userQuestions")
             ?.questions.active.some((question) => question.callId === request.wait.callId) === true;
+        const entry = pending.get(id);
+        if (entry) entry.stillPending = active;
+        continuedQuestions.set(id, active);
       }
       throw error;
     } finally {
-      if (id && !continued) pending.delete(id);
+      request.signal?.removeEventListener("abort", onAbort);
+      if (id && !continued) withdraw(id);
     }
   }
   ctx.on("approval/request", (request, next) => observeRequest("approval", request, next), {
@@ -139,6 +300,7 @@ export function apply(ctx, config) {
   });
 
   async function events(request) {
+    pruneQuestions();
     const cursor = new URL(request.url).searchParams.get("cursor");
     const prefix = `${instance}:`;
     const after = cursor?.startsWith(prefix) ? Number(cursor.slice(prefix.length)) : NaN;
@@ -172,8 +334,13 @@ export function apply(ctx, config) {
         if (request.signal.aborted) finish();
       });
     }
+    pruneQuestions();
     return Response.json(
-      { cursor: `${instance}:${sequence}`, events: collect() },
+      {
+        cursor: `${instance}:${sequence}`,
+        events: collect(),
+        activeRequestIds: [...activeRequests],
+      },
       {
         headers: { "cache-control": "no-store" },
       },
@@ -287,11 +454,13 @@ export function apply(ctx, config) {
       return Response.json({ error: "Invalid request" }, { status: 400 });
     }
     if (!presence(data)) return Response.json({ accepted: false });
+    pruneQuestions();
     const entry = pending.get(data?.id);
     if (
       !entry ||
       entry.claimedBy !== null ||
-      !config[entry.event.kind].get() ||
+      entry.event.action === "dismiss" ||
+      !enabled(entry.event.kind) ||
       !(entry.stillPending?.() ?? true)
     )
       return Response.json({ accepted: false });
@@ -319,6 +488,9 @@ export function apply(ctx, config) {
     lifetime.abort();
     for (const finish of [...waiters]) finish();
     pending.clear();
+    continuedQuestions.clear();
+    activeRequests.clear();
+    for (const sessionId of jobBatches.keys()) clearJobs(sessionId);
     clients.clear();
   });
 }

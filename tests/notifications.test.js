@@ -12,14 +12,28 @@ const background = (clientId) => ({
   canPage: true,
 });
 
-function fixture(implementation = apply) {
+function fixture(implementation = apply, preferences = {}) {
   const handlers = new Map();
   const routes = new Map();
   const agents = new Map();
   const cleanups = [];
+  const goals = new Map();
+  const questions = new Map();
+  const jobListeners = new Set();
+  const settings = {
+    systemNotification: true,
+    completed: true,
+    failed: true,
+    approval: true,
+    question: true,
+    background: false,
+    ...preferences,
+  };
   let rootOf = (agent) => agent;
   const ctx = {
-    inject() {},
+    inject(names, setup) {
+      if (names.includes("jobs")) setup(ctx);
+    },
     effect(setup) {
       const dispose = setup();
       if (dispose) cleanups.push(dispose);
@@ -28,7 +42,21 @@ function fixture(implementation = apply) {
       handlers.set(name, handler);
     },
     get(name) {
-      return name === "subagents" ? { rootOf: (agent) => rootOf(agent) } : undefined;
+      if (name === "subagents") return { rootOf: (agent) => rootOf(agent) };
+      if (name === "goals") return { get: (agent) => goals.get(agent.id) };
+      if (name === "sessionProjections")
+        return {
+          stateOf: (session) => ({ questions: { active: questions.get(session.id) ?? [] } }),
+        };
+      return undefined;
+    },
+    jobs: {
+      events: {
+        subscribe(_filter, listener) {
+          jobListeners.add(listener);
+          return () => jobListeners.delete(listener);
+        },
+      },
     },
     agents: { get: (id) => agents.get(id) },
     sessionTitle: { get: () => ({ title: "Example" }) },
@@ -42,15 +70,23 @@ function fixture(implementation = apply) {
     },
   };
   const config = Object.fromEntries(
-    ["systemNotification", "completed", "failed", "approval", "question"].map((key) => [
-      key,
-      { get: () => true },
-    ]),
+    Object.keys(settings).map((key) => [key, { get: () => settings[key] }]),
   );
   implementation(ctx, config);
   return {
     handlers,
     agents,
+    goals,
+    questions,
+    settings,
+    settleJob(event) {
+      for (const listener of jobListeners) listener(event);
+    },
+    async events(cursor) {
+      const controller = new AbortController();
+      controller.abort();
+      return (await this.call("events", undefined, { cursor, signal: controller.signal })).json();
+    },
     async end(session, reason = { kind: "completed" }) {
       handlers.get("session/event")(session, {
         type: "turn/end",
@@ -143,6 +179,301 @@ test("resolved human requests cannot be claimed after delivery", async () => {
   }
 });
 
+test("resolved requests publish a revocation to clients that already received the reminder", async () => {
+  const f = fixture();
+  try {
+    const initial = await f.events();
+    const answer = Promise.withResolvers();
+    const observation = f.handlers.get("approval/request")(
+      { agent: { session: { id: "root" } } },
+      () => answer.promise,
+    );
+    const shown = await f.events(initial.cursor);
+    const reminder = shown.events[0];
+    assert.equal(reminder.kind, "approval");
+    assert.equal(
+      (await (await f.call("claim", { id: reminder.id, ...background("a") })).json()).accepted,
+      true,
+    );
+    answer.resolve("allowed");
+    await observation;
+    const settled = await f.events(shown.cursor);
+    assert.equal(settled.events.length, 1);
+    assert.equal(settled.events[0].action, "dismiss");
+    assert.equal(settled.events[0].targetId, reminder.id);
+    assert.deepEqual((await f.events(settled.cursor)).events, []);
+  } finally {
+    f.dispose();
+  }
+});
+
+for (const rejectionCode of ["ASK_TIMED_OUT", "ASK_ABORTED"]) {
+  test(`a timed-out question stays live after ${rejectionCode} until the pending question is resolved`, async () => {
+    const f = fixture();
+    try {
+      const initial = await f.events();
+      const session = { id: "root" };
+      const controller = new AbortController();
+      f.questions.set(session.id, [{ callId: "question-call" }]);
+      await assert.rejects(
+        f.handlers.get("user-questions/request")(
+          {
+            agent: { session },
+            signal: controller.signal,
+            wait: { timed: true, callId: "question-call" },
+          },
+          async () => {
+            const timeout = Object.assign(new Error("Still waiting"), { code: "ASK_TIMED_OUT" });
+            // TimedQuestionWait aborts its signal before rejecting the waterfall.
+            controller.abort(timeout);
+            throw rejectionCode === "ASK_TIMED_OUT"
+              ? timeout
+              : Object.assign(new Error("Question wait aborted"), { code: rejectionCode });
+          },
+        ),
+        { code: rejectionCode },
+      );
+      const shown = await f.events(initial.cursor);
+      assert.equal(shown.events.length, 1);
+      assert.equal(shown.events[0].kind, "question");
+      const reminder = shown.events[0];
+      assert.deepEqual(shown.activeRequestIds, [reminder.id]);
+      assert.equal(
+        (await (await f.call("claim", { id: reminder.id, ...background("a") })).json()).accepted,
+        true,
+      );
+      assert.deepEqual((await f.events(shown.cursor)).events, []);
+      f.questions.set(session.id, []);
+      const settled = await f.events(shown.cursor);
+      assert.equal(settled.events[0].action, "dismiss");
+      assert.equal(settled.events[0].targetId, reminder.id);
+    } finally {
+      f.dispose();
+    }
+  });
+}
+
+test("aborting a pending request revokes immediately even before its handler finishes", async () => {
+  const f = fixture();
+  const answer = Promise.withResolvers();
+  try {
+    const initial = await f.events();
+    const controller = new AbortController();
+    const observation = f.handlers.get("approval/request")(
+      { agent: { session: { id: "root" } }, signal: controller.signal },
+      () => answer.promise,
+    );
+    const shown = await f.events(initial.cursor);
+    assert.deepEqual(shown.activeRequestIds, [shown.events[0].id]);
+    controller.abort();
+    const cancelled = await f.events(shown.cursor);
+    assert.equal(cancelled.events[0].targetId, shown.events[0].id);
+    assert.deepEqual(cancelled.activeRequestIds, []);
+    answer.resolve();
+    await observation;
+    assert.deepEqual((await f.events(cancelled.cursor)).events, []);
+  } finally {
+    answer.resolve();
+    f.dispose();
+  }
+});
+
+test("goal rounds stay silent and a completed goal produces one final notification", async () => {
+  const f = fixture();
+  try {
+    const session = { id: "goal-session" };
+    const agent = { id: session.id, session, status: "running" };
+    f.agents.set(agent.id, agent);
+    const initial = await f.events();
+    f.goals.set(agent.id, { id: "goal-1", revision: 1, phase: "active", activation: "armed" });
+    await f.end(session);
+    assert.deepEqual((await f.events(initial.cursor)).events, []);
+    agent.status = "running";
+    const goal = { id: "goal-1", revision: 2, phase: "complete", objective: "Finish work" };
+    f.goals.set(agent.id, goal);
+    f.handlers.get("goal/changed")({ agent, change: { operation: "complete", goal } });
+    assert.deepEqual((await f.events(initial.cursor)).events, []);
+    await f.end(session);
+    const final = await f.events(initial.cursor);
+    assert.deepEqual(
+      final.events.map((event) => event.kind),
+      ["goalCompleted"],
+    );
+    f.handlers.get("goal/changed")({ agent, change: { operation: "complete", goal } });
+    f.handlers.get("agent/status")({ agent, status: "idle" });
+    await Promise.resolve();
+    assert.deepEqual((await f.events(final.cursor)).events, []);
+  } finally {
+    f.dispose();
+  }
+});
+
+test("blocked goals notify once while a user pause or stop remains silent", async () => {
+  const f = fixture();
+  try {
+    const session = { id: "goal-session" };
+    const agent = { id: session.id, session, status: "idle" };
+    f.agents.set(agent.id, agent);
+    const initial = await f.events();
+    const goal = {
+      id: "goal-1",
+      revision: 2,
+      phase: "blocked",
+      blockedReason: { message: "Need a decision" },
+    };
+    f.goals.set(agent.id, goal);
+    f.handlers.get("goal/changed")({ agent, change: { operation: "block", goal } });
+    await Promise.resolve();
+    const blocked = await f.events(initial.cursor);
+    assert.equal(blocked.events.length, 1);
+    assert.equal(blocked.events[0].kind, "goalBlocked");
+    assert.match(blocked.events[0].detail, /Need a decision/);
+    const paused = { ...goal, revision: 3, phase: "paused" };
+    f.goals.set(agent.id, paused);
+    f.handlers.get("goal/changed")({ agent, change: { operation: "pause", goal: paused } });
+    await f.end(session, { kind: "aborted", reason: { kind: "user" } });
+    assert.deepEqual((await f.events(blocked.cursor)).events, []);
+  } finally {
+    f.dispose();
+  }
+});
+
+test("a goal reported before turn end is not repeated and a later user turn still notifies", async () => {
+  const f = fixture();
+  try {
+    const session = { id: "goal-session" };
+    const agent = { id: session.id, session, status: "idle" };
+    f.agents.set(agent.id, agent);
+    const initial = await f.events();
+    const goal = { id: "goal-1", revision: 2, phase: "complete" };
+    f.goals.set(agent.id, goal);
+    f.handlers.get("goal/changed")({ agent, change: { operation: "complete", goal } });
+    await Promise.resolve();
+    const terminal = await f.events(initial.cursor);
+    assert.deepEqual(
+      terminal.events.map((event) => event.kind),
+      ["goalCompleted"],
+    );
+    await f.end(session);
+    assert.deepEqual((await f.events(terminal.cursor)).events, []);
+    const edited = { ...goal, revision: 3 };
+    f.goals.set(agent.id, edited);
+    f.handlers.get("goal/changed")({ agent, change: { operation: "edit", goal: edited } });
+    await Promise.resolve();
+    assert.deepEqual((await f.events(terminal.cursor)).events, []);
+    f.handlers.get("session/event")(session, {
+      type: "user/message",
+      data: { source: { kind: "user" } },
+    });
+    await f.end(session);
+    assert.deepEqual(
+      (await f.events(terminal.cursor)).events.map((event) => event.kind),
+      ["completed"],
+    );
+  } finally {
+    f.dispose();
+  }
+});
+
+test("background results are opt-in, merged per conversation, and respect live settings", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture();
+  try {
+    const session = { id: "jobs-session" };
+    f.agents.set(session.id, { id: session.id, session, status: "idle" });
+    const initial = await f.events();
+    const emit = (id, status = "completed") =>
+      f.settleJob({
+        type: "settled",
+        job: { id, owner: session.id, status, label: id },
+        cause: "producer",
+        awaited: false,
+      });
+    emit("disabled-job");
+    t.mock.timers.tick(1000);
+    assert.deepEqual((await f.events(initial.cursor)).events, []);
+    f.settings.background = true;
+    emit("build");
+    emit("check", "failed");
+    t.mock.timers.tick(1000);
+    const merged = await f.events(initial.cursor);
+    assert.equal(merged.events.length, 1);
+    assert.equal(merged.events[0].kind, "jobFailed");
+    assert.equal(merged.events[0].count, 2);
+    emit("later-job");
+    f.settings.background = false;
+    t.mock.timers.tick(1000);
+    assert.deepEqual((await f.events(merged.cursor)).events, []);
+  } finally {
+    f.dispose();
+  }
+});
+
+test("awaited, cancelled, and teardown jobs stay silent and main results absorb pending jobs", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture(apply, { background: true });
+  try {
+    const session = { id: "jobs-session" };
+    const agent = { id: session.id, session, status: "running" };
+    f.agents.set(session.id, agent);
+    const initial = await f.events();
+    for (const [id, status, cause, awaited] of [
+      ["awaited", "completed", "producer", true],
+      ["cancelled", "killed", "producer", false],
+      ["disposed", "failed", "teardown", false],
+    ])
+      f.settleJob({
+        type: "settled",
+        job: { id, owner: session.id, status, label: id },
+        cause,
+        awaited,
+      });
+    t.mock.timers.tick(1000);
+    assert.deepEqual((await f.events(initial.cursor)).events, []);
+    f.settleJob({
+      type: "settled",
+      job: { id: "build", owner: session.id, status: "completed", label: "Build" },
+      cause: "producer",
+      awaited: false,
+    });
+    t.mock.timers.tick(1000);
+    assert.deepEqual((await f.events(initial.cursor)).events, []);
+    await f.end(session);
+    t.mock.timers.tick(1000);
+    const final = await f.events(initial.cursor);
+    assert.deepEqual(
+      final.events.map((event) => event.kind),
+      ["completed"],
+    );
+  } finally {
+    f.dispose();
+  }
+});
+
+test("disabling ordinary completion does not swallow an enabled background result", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture(apply, { background: true, completed: false });
+  try {
+    const session = { id: "jobs-session" };
+    f.agents.set(session.id, { id: session.id, session, status: "running" });
+    const initial = await f.events();
+    f.settleJob({
+      type: "settled",
+      job: { id: "build", owner: session.id, status: "completed", label: "Build" },
+      cause: "producer",
+      awaited: false,
+    });
+    await f.end(session);
+    t.mock.timers.tick(1000);
+    assert.deepEqual(
+      (await f.events(initial.cursor)).events.map((event) => event.kind),
+      ["jobCompleted"],
+    );
+  } finally {
+    f.dispose();
+  }
+});
+
 test("fresh subscriptions skip old notifications; cursor rotation retains gap events", async () => {
   const f = fixture();
   try {
@@ -188,7 +519,7 @@ test("idle event requests drain within three seconds for desktop update", async 
     await Promise.resolve();
     assert.equal(drained, false);
     t.mock.timers.tick(1);
-    assert.deepEqual(await pending, { cursor, events: [] });
+    assert.deepEqual(await pending, { cursor, events: [], activeRequestIds: [] });
     assert.equal(drained, true);
   } finally {
     f.dispose();
@@ -355,6 +686,7 @@ function clientFixture(f, options = {}) {
     failed: true,
     approval: true,
     question: true,
+    background: false,
     ...options.preferences,
   };
   class MockNotification {
@@ -365,6 +697,7 @@ function clientFixture(f, options = {}) {
       notices.push(this);
     }
     close() {
+      this.closed = true;
       this.onclose?.();
     }
   }
@@ -599,6 +932,110 @@ test("foreground other-session view gets a navigable page card, background denie
       c.dispose();
       f.dispose();
     }
+  }
+});
+
+test("answering a request withdraws its displayed system notification or page card", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  for (const options of [{}, { foreground: true }]) {
+    const f = fixture();
+    const c = clientFixture(f, options);
+    const answer = Promise.withResolvers();
+    try {
+      await new Promise(setImmediate);
+      const observation = f.handlers.get("approval/request")(
+        { agent: { session: { id: "approval-session" } } },
+        () => answer.promise,
+      );
+      await new Promise(setImmediate);
+      t.mock.timers.tick(100);
+      await new Promise(setImmediate);
+      if (options.foreground) assert.equal(c.runtime.getSnapshot().pages.length, 1);
+      else assert.equal(c.notices.length, 1);
+      answer.resolve("allowed");
+      await observation;
+      await new Promise(setImmediate);
+      assert.equal(c.runtime.getSnapshot().pages.length, 0);
+      if (!options.foreground) assert.equal(c.notices[0].closed, true);
+    } finally {
+      answer.resolve("allowed");
+      c.dispose();
+      f.dispose();
+    }
+  }
+});
+
+test("a revocation received while a successful claim is in flight prevents a stale notification", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const f = fixture();
+  const releaseClaim = Promise.withResolvers();
+  const claimed = Promise.withResolvers();
+  const originalCall = f.call.bind(f);
+  f.call = async (action, ...args) => {
+    const response = await originalCall(action, ...args);
+    if (action === "claim") {
+      claimed.resolve();
+      await releaseClaim.promise;
+    }
+    return response;
+  };
+  const c = clientFixture(f);
+  const answer = Promise.withResolvers();
+  try {
+    await new Promise(setImmediate);
+    const observation = f.handlers.get("user-questions/request")(
+      { agent: { session: { id: "question-session" } } },
+      () => answer.promise,
+    );
+    await new Promise(setImmediate);
+    t.mock.timers.tick(100);
+    await claimed.promise;
+    answer.resolve("answered");
+    await observation;
+    await new Promise(setImmediate);
+    releaseClaim.resolve();
+    await new Promise(setImmediate);
+    assert.equal(c.notices.length, 0);
+    assert.equal(c.runtime.getSnapshot().pages.length, 0);
+  } finally {
+    answer.resolve("answered");
+    releaseClaim.resolve();
+    c.dispose();
+    f.dispose();
+  }
+});
+
+test("active-request reconciliation closes a notification even when its revocation event was missed", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const f = fixture();
+  const originalCall = f.call.bind(f);
+  f.call = async (action, ...args) => {
+    const response = await originalCall(action, ...args);
+    if (action !== "events") return response;
+    const batch = await response.json();
+    batch.events = batch.events.filter((event) => event.action !== "dismiss");
+    return Response.json(batch);
+  };
+  const c = clientFixture(f);
+  const answer = Promise.withResolvers();
+  try {
+    await new Promise(setImmediate);
+    const observation = f.handlers.get("approval/request")(
+      { agent: { session: { id: "approval-session" } } },
+      () => answer.promise,
+    );
+    await new Promise(setImmediate);
+    t.mock.timers.tick(100);
+    await new Promise(setImmediate);
+    assert.equal(c.notices.length, 1);
+    answer.resolve("allowed");
+    await observation;
+    await new Promise(setImmediate);
+    assert.equal(c.notices[0].closed, true);
+  } finally {
+    answer.resolve("allowed");
+    c.dispose();
+    f.dispose();
   }
 });
 

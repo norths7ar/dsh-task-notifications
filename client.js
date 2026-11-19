@@ -11,8 +11,19 @@ window.__ModuleLoader__.load({
       failed: "failedTitle",
       approval: "approvalTitle",
       question: "questionTitle",
+      goalCompleted: "goalCompletedTitle",
+      goalBlocked: "goalBlockedTitle",
+      jobCompleted: "jobCompletedTitle",
+      jobFailed: "jobFailedTitle",
       test: "testTitle",
     };
+    const preferenceFor = (kind) =>
+      ({
+        goalCompleted: "completed",
+        goalBlocked: "failed",
+        jobCompleted: "background",
+        jobFailed: "background",
+      })[kind] ?? kind;
     const DICTIONARIES = {
       zh: {
         title: "任务通知",
@@ -20,6 +31,11 @@ window.__ModuleLoader__.load({
         failedTitle: "任务执行失败",
         approvalTitle: "有操作等待审批",
         questionTitle: "有问题需要你回答",
+        goalCompletedTitle: "目标已完成",
+        goalBlockedTitle: "目标受阻",
+        jobCompletedTitle: "后台任务已完成",
+        jobFailedTitle: "后台任务执行失败",
+        background: "后台任务结果",
         testTitle: "DSH 测试提醒",
         activationError: "窗口唤起失败，请从任务栏打开 DSH。",
         activationHint: "请从任务栏打开 DSH。",
@@ -63,6 +79,11 @@ window.__ModuleLoader__.load({
         failedTitle: "Task failed",
         approvalTitle: "Approval needed",
         questionTitle: "Your answer is needed",
+        goalCompletedTitle: "Goal completed",
+        goalBlockedTitle: "Goal blocked",
+        jobCompletedTitle: "Background tasks completed",
+        jobFailedTitle: "Background task failed",
+        background: "Background task results",
         testTitle: "DSH test notification",
         activationError: "Could not bring DSH forward. Open it from the taskbar.",
         activationHint: "Open DSH from the taskbar.",
@@ -138,6 +159,8 @@ window.__ModuleLoader__.load({
       const lifetime = new AbortController();
       const timers = new Set();
       const notifications = new Set();
+      const noticesById = new Map();
+      const delivering = new Map();
       const send =
         globalThis.__DSH_TRANSPORT__?.fetch ?? ((input, init) => globalThis.fetch(input, init));
       const update = (patch) => {
@@ -192,6 +215,31 @@ window.__ModuleLoader__.load({
       };
       const heartbeat = () => request("presence", presence()).catch(() => {});
       const dismiss = (id) => update({ pages: state.pages.filter((event) => event.id !== id) });
+      const withdraw = (id) => {
+        const delivery = delivering.get(id);
+        if (delivery) delivery.cancelled = true;
+        const active = noticesById.get(id);
+        if (active) {
+          active.delivery.cancelled = true;
+          active.notice.close();
+        }
+        noticesById.delete(id);
+        dismiss(id);
+      };
+      const reconcileRequests = (ids) => {
+        const active = new Set(ids);
+        const obsolete = (event) =>
+          (event.kind === "approval" || event.kind === "question") && !active.has(event.id);
+        for (const [id, delivery] of delivering) {
+          if (obsolete(delivery.event)) withdraw(id);
+        }
+        for (const [id, { delivery }] of noticesById) {
+          if (obsolete(delivery.event)) withdraw(id);
+        }
+        for (const event of state.pages) {
+          if (obsolete(event)) withdraw(event.id);
+        }
+      };
       const showPage = (event) => {
         if (!state.pages.some((page) => page.id === event.id))
           update({ pages: [...state.pages, event] });
@@ -227,12 +275,23 @@ window.__ModuleLoader__.load({
       }
 
       async function deliver(event, test = false) {
+        const delivery = { cancelled: false, event };
+        delivering.set(event.id, delivery);
+        try {
+          return await deliverActive(event, test, delivery);
+        } finally {
+          if (delivering.get(event.id) === delivery) delivering.delete(event.id);
+        }
+      }
+      async function deliverActive(event, test, delivery) {
         if (lifetime.signal.aborted) return;
         const eligibility = () => {
           const snapshot = form.getSnapshot();
-          if (snapshot.status !== "ready" || lifetime.signal.aborted) return null;
+          if (snapshot.status !== "ready" || lifetime.signal.aborted || delivery.cancelled)
+            return null;
           const preferences = snapshot.value;
-          if (!test && (!preferences[event.kind] || viewing(event.sessionId))) return null;
+          if (!test && (!preferences[preferenceFor(event.kind)] || viewing(event.sessionId)))
+            return null;
           return {
             preferences,
             canNotify:
@@ -284,12 +343,17 @@ window.__ModuleLoader__.load({
               tag: event.id,
             });
             notifications.add(notice);
-            notice.onclose = () => notifications.delete(notice);
+            noticesById.set(event.id, { notice, delivery });
+            notice.onclose = () => {
+              notifications.delete(notice);
+              if (noticesById.get(event.id)?.notice === notice) noticesById.delete(event.id);
+            };
             notice.onclick = () => {
               void openSession(event);
               notice.close();
             };
             notice.onerror = () => {
+              if (delivery.cancelled || lifetime.signal.aborted) return;
               showPage(event);
               update({
                 message: () => t("notificationError"),
@@ -326,6 +390,10 @@ window.__ModuleLoader__.load({
             cursor = batch.cursor;
             if (!state.connected && !lifetime.signal.aborted) update({ connected: true });
             for (const event of batch.events) {
+              if (event.action === "dismiss") {
+                withdraw(event.targetId);
+                continue;
+              }
               if (!TITLE_KEYS[event.kind]) continue;
               try {
                 void deliver(event).catch((error) => {
@@ -335,6 +403,7 @@ window.__ModuleLoader__.load({
                 if (!lifetime.signal.aborted) update({ message: error.message, error: true });
               }
             }
+            if (Array.isArray(batch.activeRequestIds)) reconcileRequests(batch.activeRequestIds);
           } catch (error) {
             if (!lifetime.signal.aborted) console.warn("[task-notifications]", error.message);
             // A real reconnect starts a fresh live subscription, like the old
@@ -379,6 +448,7 @@ window.__ModuleLoader__.load({
             lifetime.abort();
             for (const timer of timers) clearTimeout(timer);
             for (const notice of notifications) notice.close();
+            noticesById.clear();
           };
         },
         async test() {
@@ -506,6 +576,7 @@ window.__ModuleLoader__.load({
         row("failed", t("failed")),
         row("approval", t("approval")),
         row("question", t("question")),
+        row("background", t("background")),
         h(
           "div",
           { className: "dtn-footer" },
